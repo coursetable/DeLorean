@@ -18,5 +18,5 @@ Check `cargo run -- --help` for the most up-to-date options.
 Here's how we run it for CourseTable ferry-data:
 
 ```sh
-cargo run -- ../ferry-data output --primary-key crn --include parsed_courses/*.json -a course-table@users.noreply.github.com -a coursetable.at.yale@gmail.com -a git@harshal.sheth.io -a github-bot@harshal.sheth.io -a hsheth2@gmail.com
+cargo run -- ../ferry-data output --primary-key crn --include parsed_courses/*.json -a course-table@users.noreply.github.com -a coursetable.at.yale@gmail.com -a git@harshal.sheth.io -a github-bot@harshal.sheth.io -a hsheth2@gmail.com --graveyard graveyard
 ```

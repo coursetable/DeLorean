@@ -1,6 +1,6 @@
+use chrono::DateTime;
 use clap::Parser;
 use glob_match::glob_match;
-use chrono::DateTime;
 use indicatif::ProgressBar;
 use itertools::Itertools;
 use serde::{ser::SerializeSeq, Serialize};
@@ -16,20 +16,30 @@ struct Args {
     repo_path: String,
     output_path: String,
 
+    /// Identifies records for adding, removing, and modifying
     #[arg(long)]
     primary_key: String,
 
+    /// Glob pattern to match files to include in the diff.
     #[arg(short, long, default_value = "**/*")]
     include: String,
 
+    /// List of commit authors (name or email). If empty, all authors are included.
+    /// Otherwise, only commits by the specified authors are included.
     #[arg(short = 'a', long)]
     include_authors: Vec<String>,
 
+    /// List of revisions (their commit hashes) to ignore
     #[arg(long)]
     ignore_revs: Vec<String>,
 
+    /// A commit spec (e.g. HEAD~10) to stop at (exclusive)
     #[arg(long)]
     until: Option<String>,
+
+    /// A directory to output all removed objects
+    #[arg(long)]
+    graveyard: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,7 +167,7 @@ fn update_change_record_entry(
     primary_key: String,
     change_instant: Arc<ChangeInstant>,
     change_type: ChangeType,
-) {
+) -> bool {
     let change_record = change_record_entry
         .entry(primary_key)
         .or_insert(ChangeRecord {
@@ -171,11 +181,13 @@ fn update_change_record_entry(
         }
         ChangeType::Removed => {
             change_record.removed.push(change_instant);
+            return change_record.added.is_empty();
         }
         ChangeType::Modified => {
             change_record.modified.push(change_instant);
         }
     }
+    return false;
 }
 
 fn main() {
@@ -199,6 +211,7 @@ fn main() {
     let mut cached_data: HashMap<PathBuf, HashMap<String, serde_json::Value>> = HashMap::new();
     let mut prev_oid = git2::Oid::zero();
     revwalk.set_sorting(git2::Sort::TIME).unwrap();
+    let mut graveyard: HashMap<PathBuf, HashMap<String, serde_json::Value>> = HashMap::new();
 
     for oid in revwalk {
         let oid = oid.expect("Failed to get oid");
@@ -272,6 +285,7 @@ fn main() {
             let change_record_entry = change_records
                 .entry(new_path.to_path_buf())
                 .or_insert(HashMap::new());
+            let graveyard_entry = graveyard.entry(new_path.to_path_buf()).or_insert(HashMap::new());
             match &delta.status() {
                 git2::Delta::Added => {
                     let new_content = cached_data
@@ -285,10 +299,10 @@ fn main() {
                             ))
                         })
                         .unwrap();
-                    for (pk, _) in new_content {
+                    for pk in new_content.keys() {
                         update_change_record_entry(
                             change_record_entry,
-                            pk,
+                            pk.to_string(),
                             change_instant.clone(),
                             ChangeType::Added,
                         );
@@ -297,13 +311,16 @@ fn main() {
                 git2::Delta::Deleted => {
                     let old_content =
                         get_json_data(&repo, &parent_tree, old_path, &args.primary_key);
-                    for (pk, _) in &old_content {
-                        update_change_record_entry(
+                    for pk in old_content.keys() {
+                        let should_graveyard = update_change_record_entry(
                             change_record_entry,
                             pk.to_string(),
                             change_instant.clone(),
                             ChangeType::Removed,
                         );
+                        if should_graveyard && args.graveyard.is_some() {
+                            graveyard_entry.insert(pk.to_string(), old_content.get(pk).unwrap().clone());
+                        }
                     }
                     next_cached_data.insert(old_path.to_path_buf(), old_content);
                 }
@@ -328,12 +345,18 @@ fn main() {
                         let new_val = match new_content.get(pk) {
                             Some(new_val) => new_val,
                             None => {
-                                update_change_record_entry(
+                                let should_graveyard = update_change_record_entry(
                                     change_record_entry,
                                     pk.to_string(),
                                     change_instant.clone(),
                                     ChangeType::Removed,
                                 );
+                                if should_graveyard && args.graveyard.is_some() {
+                                    graveyard_entry.insert(
+                                        pk.to_string(),
+                                        old_content.get(pk).unwrap().clone(),
+                                    );
+                                }
                                 continue;
                             }
                         };
@@ -373,5 +396,18 @@ fn main() {
             .sorted_by_key(|v| v.0)
             .collect::<BTreeMap<_, _>>();
         serde_json::to_writer_pretty(file, &sorted_map).expect("Failed to write json");
+    }
+    if let Some(graveyard_path) = args.graveyard {
+        let graveyard_path = Path::new(&graveyard_path);
+        for (path, graveyard_entry) in graveyard {
+            let output_path = Path::join(graveyard_path, &path);
+            fs::create_dir_all(output_path.parent().unwrap()).expect("Failed to create directory");
+            let file = File::create(output_path).unwrap();
+            let sorted_map = graveyard_entry
+                .iter()
+                .sorted_by_key(|v| v.0)
+                .collect::<BTreeMap<_, _>>();
+            serde_json::to_writer_pretty(file, &sorted_map).expect("Failed to write json");
+        }
     }
 }
